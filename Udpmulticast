@@ -1,0 +1,305 @@
+[11.8, 04:28] ilay: #include "UdpMulticast.h"
+#include <sys/uio.h>
+
+// Initialize static members
+QueueHandle_t UdpMulticast::messageQueue = nullptr;
+SemaphoreHandle_t UdpMulticast::accessMutex = nullptr;
+TickType_t UdpMulticast::lastReceiveTime = 0;
+
+UdpMulticast::UdpMulticast(const std::string& multicastAddress, uint16_t port)
+    : multicastAddress(multicastAddress), port(port), sockfd(-1), sendTaskHandle(nullptr) {
+    memset(&multicastAddr, 0, sizeof(multicastAddr));
+    memset(&mreq, 0, sizeof(mreq));
+
+    // Initialize the queue and mutex only if they are not already created
+    if (messageQueue == nullptr) {
+        messageQueue = xQueueCreate(QUEUE_SIZE, sizeof(PacketInfo*));
+    }
+    if (accessMutex == nullptr) {
+        accessMutex = xSemaphoreCreateMutex();
+    }
+}
+
+UdpMulticast::~UdpMulticast() {
+    leaveGroup();
+    if (sockfd != -1) {
+        close(sockfd);
+    }
+    // Do not delete the queue or mutex here as they are shared
+}
+
+bool UdpMulticast::init() {
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        ESP_LOGE("UdpMulticast", "Socket creation failed");
+        return false;
+    }
+
+    multicastAddr.sin_family = AF_INET;
+    multicastAddr.sin_port = htons(port);
+    multicastAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sockfd, (struct sockaddr*)&multicastAddr, sizeof(multicastAddr)) < 0) {
+        ESP_LOGE("UdpMulticast", "Socket binding failed");
+        return false;
+    }
+
+    // Set the TTL for multicast packets to 1
+    uint8_t ttl = 1;
+    if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
+        ESP_LOGE("UdpMulticast", "Failed to set multicast TTL");
+        return false;
+    }
+
+    return true;
+}
+
+bool UdpMulticast::joinGroup() {
+    mreq.imr_multiaddr.s_addr = inet_addr(multicastAddress.c_str());
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+    if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        ESP_LOGE("UdpMulticast", "Failed to join multicast group");
+        return false;
+    }
+
+    return true;
+}
+
+void UdpMulticast::leaveGroup() {
+    setsockopt(sockfd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+}
+
+void UdpMulticast::startReceiveTask() {
+    xTaskCreate(receiveTask, "UdpMulticastReceiveTask", 4096, this, 5, nullptr);
+}
+
+void UdpMulticast::startSendTask() {
+    xTaskCreate(sendTask, "UdpMulticastSendTask", 4096, this, 5, &sendTaskHandle);
+}
+
+void UdpMulticast::startQueueProcessingTask() {
+    xTaskCreate(queueProcessingTask, "UdpMulticastQueueProcessingTask", 4096, this, 5, nullptr);
+}
+
+bool UdpMulticast::send(const std::string& message) 
+{
+    // Ensure the message length is within the buffer size
+    if (message.length() >= BUFFER_SIZE) {
+        ESP_LOGE("UdpMulticast", "Message too long to send");
+        return false;
+    }
+
+    struct sockaddr_in destAddr;
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(port);
+    destAddr.sin_addr.s_addr = inet_addr(multicastAddress.c_str());
+
+    ssize_t sentLen = sendto(sockfd, message.c_str(), message.length(), 0,
+                             (struct sockaddr*)&destAddr, sizeof(destAddr));
+    if (sentLen < 0) {
+        ESP_LOGE("UdpMulticast", "Failed to send message");
+        return false;
+    }
+
+    ESP_LOGI("UdpMulticast", "Message sent: %s", message.c_str());
+    return true;
+}
+
+void UdpMulticast::receiveTask(void* pvParameters) {
+    UdpMulticast* multicast = static_cast<UdpMulticast*>(pvParameters);
+
+    char buffer[BUFFER_SIZE];
+    struct sockaddr_in senderAddr;
+    struct iovec iov[1];
+    struct msghdr msg;
+    struct cmsghdr *cmsg;
+    char control[CMSG_SPACE(sizeof(struct in_addr))];
+
+    while (true) 
+    {
+        // if (xSemaphoreTake(accessMutex, portMAX_DELAY) == pdTRUE) {
+        // Release the mutex after receiving
+        // } xSemaphoreGive(accessMutex);
+
+        iov[0].iov_base = buffer;
+        iov[0].iov_len = sizeof(buffer);
+
+        msg.msg_name = &senderAddr;
+        msg.msg_namelen = sizeof(senderAddr);
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        msg.msg_flags = 0;
+
+        int len = recvmsg(multicast->sockfd, &msg, 0);
+        
+        if (len > 0) 
+        {
+            buffer[len] = '\0';
+            // ESP_LOGI("UdpMulticast", "Received: %s from %s", buffer, inet_ntoa(senderAddr.sin_addr));
+
+            PacketInfo* pktInfo = new PacketInfo;
+            pktInfo->data = new char[len];
+
+            strncpy(pktInfo->data, buffer, len);
+            pktInfo->senderAddr = senderAddr;
+
+            if (xQueueSend(UdpMulticast::messageQueue, &pktInfo, portMAX_DELAY) != pdPASS) 
+            {
+                ESP_LOGE("UdpMulticast", "Failed to enqueue message");
+            }
+        }
+    }
+}
+
+void UdpMulticast::queueProcessingTask(void* pvParameters) {
+    UdpMulticast* multicast = static_cast<UdpMulticast*>(pvParameters);
+    PacketInfo* pktInfo;
+
+    while (true) {
+        if (xQueueReceive(UdpMulticast::messageQueue, &pktInfo, portMAX_DELAY) == pdPASS) {
+            ESP_LOGI("UdpMulticast", "Processing and sending from queue: (from %s)", inet_ntoa(pktInfo->senderAddr.sin_addr));
+
+            ssize_t sentLen = sendto(multicast->sockfd, pktInfo->data, strlen(pktInfo->data), 0, 
+                                     (struct sockaddr*)&multicast->multicastAddr, sizeof(multicast->multicastAddr));
+            delete[] pktInfo->data;
+            delete pktInfo;
+            
+            if (sentLen < 0) {
+                ESP_LOGE("UdpMulticast", "Failed to send message");
+            }
+            vTaskDelay(pdMS_TO_TICKS(80)); // Delay for 80 milliseconds
+        }
+    }
+}
+
+void UdpMulticast::sendTask(void* pvParameters) {
+    UdpMulticast* multicast = static_cast<UdpMulticast*>(pvParameters);
+    // Additional logic for this task can be implemented if needed.
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for the notification to send a message
+        // Use this task if you need to send notifications or control the sending process manually.
+    }
+}
+[11.8, 04:28] ilay: #ifndef UDP_MULTICAST_H
+#define UDP_MULTICAST_H
+
+#include <string>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+class UdpMulticast {
+public:
+    UdpMulticast(const std::string& multicastAddress, uint16_t port);
+    ~UdpMulticast();
+
+    bool init();
+    bool joinGroup();
+    void leaveGroup();
+
+    void startReceiveTask();
+    void startSendTask();
+    void startQueueProcessingTask();
+    
+    bool send(const std::string& message);
+private:
+    static void receiveTask(void* pvParameters);
+    static void sendTask(void* pvParameters);
+    static void queueProcessingTask(void* pvParameters);
+
+    std::string multicastAddress;
+    uint16_t port;
+    int sockfd;
+    struct sockaddr_in multicastAddr;
+    struct ip_mreq mreq;
+
+    TaskHandle_t sendTaskHandle;
+
+    static QueueHandle_t messageQueue;
+    static SemaphoreHandle_t accessMutex;
+    static TickType_t lastReceiveTime;
+
+    static constexpr size_t QUEUE_SIZE = 20;
+    static constexpr size_t BUFFER_SIZE = 1450;
+    static constexpr TickType_t TIMEOUT_MS = pdMS_TO_TICKS(200);
+
+    struct PacketInfo {
+        char* data;
+        struct sockaddr_in senderAddr;
+    };
+};
+
+#endif // UDP_MULTICAST_H
+[11.8, 04:28] ilay: /* UDP MultiCast Send/Receive Example
+
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+#include <string.h>
+#include <sys/param.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
+#include "esp_mac.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+
+#include "WiFiAp.h"
+#include "UdpMulticast.h"
+#include <string>
+#include <iostream>
+
+const std::string MULTICAST_ADDRESS = "239.255.0.1";
+const uint16_t MULTICAST_PORT = 12345;
+
+extern "C" void app_main() {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    WiFiAp::Instance().start();
+
+    UdpMulticast multicast(MULTICAST_ADDRESS, MULTICAST_PORT);
+
+    if (!multicast.init() || !multicast.joinGroup()) {
+        std::cerr << "Failed to initialize or join multicast group" << std::endl;
+        return;
+    }
+
+    multicast.startReceiveTask();
+    multicast.startSendTask();
+    multicast.startQueueProcessingTask();
+
+    std::string message = "Hello, Multicast Group!";
+    if (multicast.send(message)) {
+        std::cout << "Message sent successfully" << std::endl;
+    } else {
+        std::cerr << "Failed to send message" << std::endl;
+    }
+
+    while (true) {
+        vTaskDelay(portMAX_DELAY);
+    }
+}
