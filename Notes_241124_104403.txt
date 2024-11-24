@@ -1,0 +1,163 @@
+#pragma once
+#include <functional>
+#include <map>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <esp_event.h>
+
+class EventFramework {
+public:
+    using EventCallback = std::function<void(void* event_data)>;
+    
+    // Constructor and Destructor
+    EventFramework();
+    ~EventFramework();
+
+    // Register Event
+    void registerEvent(
+        esp_event_base_t event_base,
+        int32_t event_id,
+        EventCallback callback,
+        bool dedicated_task = false);
+
+    // Deregister Event
+    void deregisterEvent(esp_event_base_t event_base, int32_t event_id);
+
+    // Post Event
+    void postEvent(
+        esp_event_base_t event_base,
+        int32_t event_id,
+        void* event_data = nullptr,
+        size_t event_data_size = 0);
+
+    // Create Custom User Loop
+    void createUserLoop(bool dedicated_task = false);
+
+    // Destroy User Loop
+    void destroyUserLoop();
+
+private:
+    // Default Event Loop
+    esp_event_loop_handle_t default_loop_;
+
+    // User-defined Event Loop
+    esp_event_loop_handle_t user_loop_;
+    TaskHandle_t user_loop_task_;
+
+    // Registered Event Handlers
+    struct EventHandler {
+        EventCallback callback;
+        bool dedicated_task;
+        TaskHandle_t task_handle;
+    };
+
+    std::map<std::pair<esp_event_base_t, int32_t>, EventHandler> handlers_;
+
+    // Mutex for thread-safety
+    std::mutex handler_mutex_;
+
+    // Internal Functions
+    static void eventTask(void* param);
+    void dispatchEvent(const EventHandler& handler, void* event_data);
+};
+
+#include "EventFramework.h"
+#include <esp_log.h>
+
+static const char* TAG = "EventFramework";
+
+EventFramework::EventFramework() : default_loop_(nullptr), user_loop_(nullptr), user_loop_task_(nullptr) {
+    esp_event_loop_args_t loop_args = {};
+    loop_args.queue_size = 10;
+    loop_args.task_name = nullptr; // No dedicated task by default
+    esp_event_loop_create_default(); // Use default ESP-IDF event loop
+    ESP_LOGI(TAG, "Initialized Event Framework");
+}
+
+EventFramework::~EventFramework() {
+    destroyUserLoop();
+    esp_event_loop_delete_default();
+}
+
+void EventFramework::registerEvent(esp_event_base_t event_base, int32_t event_id, EventCallback callback, bool dedicated_task) {
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    handlers_[{event_base, event_id}] = {callback, dedicated_task, nullptr};
+}
+
+void EventFramework::deregisterEvent(esp_event_base_t event_base, int32_t event_id) {
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    auto it = handlers_.find({event_base, event_id});
+    if (it != handlers_.end()) {
+        if (it->second.task_handle) {
+            vTaskDelete(it->second.task_handle);
+        }
+        handlers_.erase(it);
+    }
+}
+
+void EventFramework::postEvent(esp_event_base_t event_base, int32_t event_id, void* event_data, size_t event_data_size) {
+    auto it = handlers_.find({event_base, event_id});
+    if (it != handlers_.end()) {
+        if (it->second.dedicated_task) {
+            xTaskCreate(eventTask, "event_task", 4096, &it->second, 5, &it->second.task_handle);
+        } else {
+            dispatchEvent(it->second, event_data);
+        }
+    }
+}
+
+void EventFramework::createUserLoop(bool dedicated_task) {
+    esp_event_loop_args_t loop_args = {};
+    loop_args.queue_size = 10;
+    loop_args.task_name = dedicated_task ? "user_loop_task" : nullptr;
+    esp_event_loop_create(&loop_args, &user_loop_);
+    if (dedicated_task) {
+        xTaskCreate(eventTask, "user_event_task", 4096, user_loop_, 5, &user_loop_task_);
+    }
+}
+
+void EventFramework::destroyUserLoop() {
+    if (user_loop_task_) {
+        vTaskDelete(user_loop_task_);
+    }
+    if (user_loop_) {
+        esp_event_loop_delete(user_loop_);
+    }
+}
+
+void EventFramework::eventTask(void* param) {
+    EventHandler* handler = static_cast<EventHandler*>(param);
+    handler->callback(nullptr); // Execute callback with no data
+    vTaskDelete(nullptr);
+}
+
+void EventFramework::dispatchEvent(const EventHandler& handler, void* event_data) {
+    handler.callback(event_data);
+}
+
+class Producer {
+public:
+    void sendMessage(EventFramework& event_framework, const char* message) {
+        event_framework.postEvent("custom_event", 1, (void*)message, strlen(message) + 1);
+    }
+};
+class Consumer {
+public:
+    void listen(EventFramework& event_framework) {
+        event_framework.registerEvent("custom_event", 1, [](void* data) {
+            const char* message = static_cast<const char*>(data);
+            ESP_LOGI("Consumer", "Received message: %s", message);
+        });
+    }
+};
+extern "C" void app_main() {
+    EventFramework event_framework;
+    event_framework.createUserLoop(true); // User loop with a dedicated task
+
+    Producer producer;
+    Consumer consumer;
+
+    consumer.listen(event_framework);
+    producer.sendMessage(event_framework, "Hello, ESP32!");
+}
